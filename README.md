@@ -36,13 +36,19 @@ Windows · PowerShell 7+ · 无需额外安装任何东西（复用 DSH 自带�
 | 手动做的麻烦事 | 脚本怎么处理 |
 | --- | --- |
 | 得自己查每个插件的最新版 | 直连 npm registry 比对 `dist-tags` |
-| 得自己读 `engines.dsh` 判断兼不兼容 | 自动解析 semver 范围，标出不兼容的 |
+| 得自己判断兼不兼容 | 自动解析三种兼容声明，标出结果 |
+| 最新版要求更高版本的 DSH，装了插件就不工作 | **自动改投最新的兼容版本**，不会硬装 |
+| 已经装上的插件其实与当前 DSH 不兼容 | 报告出来，`-Repair` 可退回兼容版本 |
 | 得记得加 `-w`，否则 `ERR_PNPM_ADDING_TO_ROOT` | 自动检测 `pnpm-workspace.yaml` 并注入 |
 | 新发布的版本装不上（pnpm 默认等 1 天） | 自动带 `--config.minimum-release-age=0` |
 | 忘了只退 DSH、终端其实是 DSH 的子进程 | 预检进程 + 警告不要用 DSH 内置终端 |
 | 装完不知道到底成没成 | 核对 `package.json` 与 `node_modules` 两边版本 |
 | 万一装坏了没法回退 | 装之前自动备份三个清单文件 |
 | 跨盘跑 pnpm 会另建 store | 始终在 profile 目录（通常在 C 盘）里执行 |
+
+> **关于兼容性**：DSH 插件把「要求哪个 DSH」写在三个可能的地方——
+> `dsh.engines.dsh`、`engines.dsh`、`peerDependencies["@deepseek-ai/dsh"]`。
+> 三种写法都认。只要有一处声明不满足当前 DSH，这个版本就不会被选中。
 
 ---
 
@@ -98,6 +104,9 @@ pwsh -File .\Update-DshPlugins.ps1 -Batch
 # 装预发布版
 pwsh -File .\Update-DshPlugins.ps1 -Tag beta
 
+# 已装的插件与当前 DSH 不兼容时，退回兼容版本
+pwsh -File .\Update-DshPlugins.ps1 -Repair
+
 # 整份退回某个备份
 pwsh -File .\Update-DshPlugins.ps1 -RollbackFrom .\_backups\profile-20261121-094129
 ```
@@ -113,7 +122,8 @@ pwsh -File .\Update-DshPlugins.ps1 -RollbackFrom .\_backups\profile-20261121-094
 | `-DryRun` | 打印命令，不产生写入 |
 | `-Batch` | 合并成一次 `pnpm add` |
 | `-Tag <tag>` | npm dist-tag，默认 `latest` |
-| `-AllowIncompatible` | `engines.dsh` 不满足也照装 |
+| `-AllowIncompatible` | 兼容性声明不满足也照装最新版（可能起不来） |
+| `-Repair` | 已装的插件与当前 DSH 不兼容时，退回该插件的最新兼容版本 |
 | `-IncludeGit` | 连 `github:` 依赖一起重新解析 |
 | `-Force` | 跳过 DSH 运行检查（不建议） |
 | `-NoBackup` | 不备份清单文件 |
@@ -127,7 +137,7 @@ pwsh -File .\Update-DshPlugins.ps1 -RollbackFrom .\_backups\profile-20261121-094
 | 阶段 | 行为 |
 | --- | --- |
 | 预检 | 定位 DSH 自带的 node/pnpm；确认 `DeepSeek Harness` 进程已退出 |
-| 查新 | `check-updates.mjs` 直连 npm registry，比对 `dist-tags`，读 `engines.dsh` 判兼容 |
+| 查新 | `check-updates.mjs` 直连 npm registry，比对 `dist-tags`，读三种兼容声明判兼容，必要时改投最新兼容版 |
 | 备份 | 三个清单文件复制到 `_backups\profile-<时间戳>\` |
 | 安装 | 在 profile 目录执行 `pnpm add -w --save-exact --config.minimum-release-age=0 <包>@<版本>` |
 | 校验 | 核对 `package.json` 与 `node_modules` 两边版本 |
@@ -139,6 +149,7 @@ pwsh -File .\Update-DshPlugins.ps1 -RollbackFrom .\_backups\profile-20261121-094
 - **`--config.minimum-release-age=0`** —— pnpm 默认对新版本有 1440 分钟的「冷静期」，刚发布的装不上。市场内部也带了这个参数。
 - **`--save-exact`** —— 与市场写法一致，`package.json` 里记精确版本而不是 `^x.y.z`。
 - **逐包安装**（默认）—— 某个插件失败不连累其它。
+- **构建脚本被拦不算失败** —— pnpm 11 默认 `strictDepBuilds=true`，只要有依赖的构建脚本被拦，即使包已装好也会 `exit 1` 并报 `ERR_PNPM_IGNORED_BUILDS`。脚本会区分这种「只有构建脚本被拦」的情况：照常判成功，只提示是哪些依赖，不误报失败。
 
 ## 它不做什么
 
@@ -159,6 +170,16 @@ pwsh -File .\Update-DshPlugins.ps1 -RollbackFrom .\_backups\profile-20261121-094
 **某个插件更新后 DSH 起不来**
 
 用汇总里打印的 `-RollbackFrom` 命令整体退回。回滚会恢复三个文件并重装依赖；如果发现 `node_modules` 里的版本没真的换回来，会自动再跑一次 `--force` 重新链接。
+
+**市场里某个插件显示「与 DSH 不兼容」**
+
+说明它当前装的版本要求更高的 DSH。跑一次 `-Repair`：
+
+```powershell
+pwsh -File .\Update-DshPlugins.ps1 -Repair
+```
+
+脚本会拉该插件的全部版本，挑出最后一个兼容当前 DSH 的装上——通常就是升级前那个版本，插件的配置会保留。
 
 **想彻底重来**
 
@@ -209,6 +230,9 @@ node .\check-updates.mjs "$env:USERPROFILE\.dsh\profiles\desktop" --dsh 0.2.2-rc
 - 单包更新 `dsh-unlag` 1.17.5 → 1.17.10，22.9s，校验通过
 - 全量更新 7 个包，全部成功，其中 `dsh-univer-office` 0.4.0 → 0.5.0（160 MB）38s
 - `-Check`、`-DryRun`、`-Only`、`-Batch`、错误 dist-tag、不存在的包名、回滚路径都走过
+- 兼容性判断：`@linxin666/dsh-web-all` 0.4.22 要求 DSH `>=0.2.3-alpha.2`（声明在 `dsh.engines.dsh`），脚本正确识别为不兼容，改投 0.4.21
+- `-Repair`：已装 0.4.22 与 DSH 0.2.2-rc.5 不兼容时，退回 0.4.21，校验通过
+- 构建脚本判定：pnpm 报 `ERR_PNPM_IGNORED_BUILDS` 但包已装好时，判成功并列出被拦的依赖；混杂其它 `ERR_PNPM_*` 时仍判失败
 
 ## 许可证
 

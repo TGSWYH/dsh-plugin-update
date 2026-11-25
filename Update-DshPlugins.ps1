@@ -34,7 +34,10 @@
   npm dist-tag，默认 latest。
 
 .PARAMETER AllowIncompatible
-  engines.dsh 不满足当前 DSH 版本时也照装（默认跳过并提示）。
+  engines.dsh 不满足当前 DSH 版本时也照装（默认改投「最新的兼容版本」；连兼容版本都没有就跳过）。
+
+.PARAMETER Repair
+  已装的版本与当前 DSH 不兼容时，自动退回该插件最新的兼容版本（即使没有新版本可升）。
 
 .PARAMETER IncludeGit
   连 github:/git: 依赖一起尝试（按分支/HEAD 重新解析）。默认跳过。
@@ -70,6 +73,7 @@ param(
   [switch]$Batch,
   [string]$Tag = 'latest',
   [switch]$AllowIncompatible,
+  [switch]$Repair,
   [switch]$IncludeGit,
   [switch]$Force,
   [switch]$NoBackup,
@@ -247,6 +251,27 @@ function Invoke-PnpmStep {
     $sw.Stop(); $res.Seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
   }
   return $res
+}
+
+# pnpm 11 默认 strictDepBuilds=true：只要有依赖的构建脚本被拦，
+# 即使包本身已经装好了，也会 exit 1 并报 ERR_PNPM_IGNORED_BUILDS。
+# 这不是安装失败，不能据此判负 —— 真正结果要看 package.json / node_modules。
+function Test-OnlyIgnoredBuilds($res) {
+  if ($res.ExitCode -eq 0) { return $false }
+  if ($res.Output -notmatch 'ERR_PNPM_IGNORED_BUILDS|Ignored build scripts') { return $false }
+  # 除了这条，还有别的 ERR_PNPM_* 就说明确实失败了
+  $other = [regex]::Matches($res.Output, 'ERR_PNPM_[A-Z_]+') |
+    ForEach-Object { $_.Value } |
+    Where-Object { $_ -ne 'ERR_PNPM_IGNORED_BUILDS' } |
+    Select-Object -Unique
+  return (@($other).Count -eq 0)
+}
+
+# 报告被拦下的构建脚本（不阻塞，纯提示）
+function Write-IgnoredBuildsNote([string]$output) {
+  $m = [regex]::Match($output, 'Ignored build scripts:\s*([^\r\n]+)')
+  if (-not $m.Success) { return }
+  Write-Warn ("pnpm 拦下了这些依赖的构建脚本（不影响插件本体，DSH 启动时会按需处理）: {0}" -f $m.Groups[1].Value.Trim())
 }
 
 function Read-ProfileDeps([string]$dir) {
@@ -480,9 +505,29 @@ $view = $rows | Select-Object @{ n = '插件'; e = { $_.name } },
   @{ n = '最新'; e = { if ($_.latest) { $_.latest } else { '-' } } },
   @{ n = '可更新'; e = { if ($_.hasUpdate) { '是' } else { '' } } },
   @{ n = '引擎要求'; e = { if ($_.enginesDsh) { $_.enginesDsh } else { '' } } },
+  @{ n = '声明位置'; e = { if ($_.enginesFrom) { $_.enginesFrom } else { '' } } },
   @{ n = '兼容'; e = { if ($null -eq $_.compatible) { '' } elseif ($_.compatible) { 'ok' } else { '否' } } },
+  @{ n = '目标'; e = { if ($_.target) { $_.target } else { '' } } },
   @{ n = '备注'; e = { $_.note } }
 Write-Host ($view | Format-Table -AutoSize | Out-String -Width 200).TrimEnd()
+
+# 已经躺在 node_modules 里、但与当前 DSH 不兼容的插件：脚本更新不了它，但要让人知道
+$brokenNow = @($rows | Where-Object { $_.installedCompatible -eq $false })
+if ($brokenNow.Count -gt 0) {
+  Write-Host ''
+  foreach ($b in $brokenNow) {
+    $fix = if ($b.bestCompatible) { "可退回 $($b.bestCompatible)（加 -Repair）" } else { '找不到兼容版本，需要等插件发布适配版本' }
+    Write-Warn ("当前已装的 {0}@{1} 与 DSH {2} 不兼容（它要求 {3}，声明在 {4}）—— {5}" -f $b.name, $b.installed, $dshVer, $b.installedRange, $b.installedRangeFrom, $fix)
+  }
+}
+
+# 最新版不兼容但存在最新兼容版：说明改投了哪个版本
+$downgraded = @($rows | Where-Object { $_.targetNote -and $_.target })
+foreach ($d in $downgraded) { Write-Info ("{0}：{1}" -f $d.name, $d.targetNote) }
+
+# 最新版不兼容、且没有任何兼容版本可投
+$stuck = @($rows | Where-Object { $_.hasUpdate -and -not $_.target })
+foreach ($s in $stuck) { Write-Warn ("{0}：{1}" -f $s.name, $(if ($s.targetNote) { $s.targetNote } else { '没有可安装的兼容版本' })) }
 
 Write-Info "共 $($rows.Count) 个依赖，可更新 $($updatable.Count) 个，Git/本地依赖 $($gitDeps.Count) 个。"
 if ($gitDeps.Count -gt 0 -and -not $IncludeGit) {
@@ -494,60 +539,74 @@ if ($Check) {
   Write-Host '仅检查模式，未做任何修改。' -ForegroundColor Green
   exit 0
 }
-if ($updatable.Count -eq 0) {
-  Write-Host ''
-  Write-Host '全部插件已是最新。' -ForegroundColor Green
-  exit 0
+
+# ---- 选目标 ----
+# 默认：装 target（= 最新版；最新版不兼容时自动改投最新的兼容版）
+# -Repair：顺手把「已装版本本身就不兼容」的插件退回兼容版本，哪怕它没有新版本可升
+# -AllowIncompatible：无视兼容性，硬装 latest
+$candidates = @()
+foreach ($r in $rows) {
+  if ($r.kind -eq 'git') { if (-not $IncludeGit) { continue } else { $r.target = $r.latest; $candidates += $r; continue } }
+  if ($AllowIncompatible -and $r.hasUpdate -and $r.compatible -eq $false) {
+    $r.target = $r.latest
+    $r.targetNote = "已指定 -AllowIncompatible，硬装 $($r.latest)（要求 DSH $($r.enginesDsh)）"
+    $candidates += $r
+    continue
+  }
+  if (-not $r.target) { continue }
+  if ($r.hasUpdate) { $candidates += $r }
+  elseif ($Repair -and $r.installedCompatible -eq $false) { $candidates += $r }
 }
 
-# ---- 目标筛选 ----
-$targets = $updatable
+$targets = $candidates
 if ($Only.Count -gt 0) {
   $targets = @()
   foreach ($pat in $Only) {
-    $hit = @($updatable | Where-Object { $_.name -like $pat })
+    $hit = @($candidates | Where-Object { $_.name -like $pat })
     if ($hit.Count -eq 0) {
       $known = @($rows | Where-Object { $_.name -like $pat })
-      if ($known.Count -gt 0) { Write-Warn "$pat 没有新版本，跳过" }
+      if ($known.Count -gt 0) {
+        $why = if ($known[0].targetNote) { $known[0].targetNote } else { '没有新版本' }
+        Write-Warn "$pat 无需处理：$why"
+      }
       else { Write-Warn "$pat 不在 profile 的依赖里，跳过" }
     }
     $targets += $hit
   }
   $targets = @($targets | Sort-Object name -Unique)
 }
-if (-not $IncludeGit) { $targets = @($targets | Where-Object { $_.kind -ne 'git' }) }
 if ($targets.Count -eq 0) {
   Write-Host ''
-  Write-Host '没有需要处理的插件。' -ForegroundColor Green
+  if ($brokenNow.Count -gt 0 -and -not $Repair) {
+    Write-Host '没有可更新的插件；但有已装插件与当前 DSH 不兼容，加 -Repair 可退回兼容版本。' -ForegroundColor Yellow
+  }
+  elseif ($stuck.Count -gt 0) {
+    Write-Host '没有可安装的插件：有新版本，但都要求比当前更新的 DSH。' -ForegroundColor Yellow
+    Write-Host '  等 DSH 升级后再跑，或加 -AllowIncompatible 硬装（可能起不来）。' -ForegroundColor DarkGray
+  }
+  else { Write-Host '全部插件已是最新。' -ForegroundColor Green }
   exit 0
 }
 
-# ---- 兼容性筛 ----
+# ---- 逐个确认目标，并标记「退回」 ----
 $chosen = @()
 foreach ($t in $targets) {
-  if ($t.compatible -eq $false -and -not $AllowIncompatible) {
-    Write-Warn ("跳过 {0}：它要求 DSH {1}，当前是 {2}（要强行装加 -AllowIncompatible）" -f $t.name, $t.enginesDsh, $dshVer)
-    continue
-  }
-  if ($t.deprecated) { Write-Warn ("{0} 的最新版被标记为已废弃：{1}" -f $t.name, $t.deprecated) }
+  if ($t.deprecated) { Write-Warn ("{0} 的 {1} 被标记为已废弃：{2}" -f $t.name, $t.target, $t.deprecated) }
   $chosen += $t
 }
-if ($chosen.Count -eq 0) {
-  Write-Host ''
-  Write-Host '筛选后没有可安装的插件。' -ForegroundColor Green
-  exit 0
-}
 
-$specs = @($chosen | ForEach-Object { "$($_.name)@$($_.latest)" })
+$specs = @($chosen | ForEach-Object { "$($_.name)@$($_.target)" })
 $baseArgs = @('add', '-w', '--save-exact', '--config.minimum-release-age=0')
 
 Write-Head '计划'
 foreach ($t in $chosen) {
   $sizeTxt = ''
   if ($t.unpackedSize) { $sizeTxt = '  [' + [Math]::Round($t.unpackedSize / 1MB) + ' MB]' }
-  Write-Info ("{0}  {1} -> {2}{3}" -f $t.name, $t.current, $t.latest, $sizeTxt)
+  $arrow = if ($t.isDowngrade) { '  <- 退回 ' } else { '  -> ' }
+  Write-Info ("{0}  {1}{2}{3}{4}" -f $t.name, $(if ($t.installed) { $t.installed } else { $t.current }), $arrow, $t.target, $sizeTxt)
+  if ($t.targetNote) { Write-Info ("        {0}" -f $t.targetNote) }
 }
-Write-LogLine ('plan: ' + (($chosen | ForEach-Object { "$($_.name)@$($_.latest)" }) -join ' '))
+Write-LogLine ('plan: ' + (($chosen | ForEach-Object { "$($_.name)@$($_.target)" }) -join ' '))
 
 if ($DryRun) {
   Write-Head '将执行的命令（-DryRun，未实际运行）'
@@ -558,7 +617,7 @@ if ($DryRun) {
   else {
     foreach ($t in $chosen) {
       Write-Host ('  cd "{0}"' -f $dir) -ForegroundColor DarkGray
-      Write-Host ('  node "{0}" {1} {2}@{3}' -f $script:Tools.PnpmScript, ($baseArgs -join ' '), $t.name, $t.latest) -ForegroundColor DarkGray
+      Write-Host ('  node "{0}" {1} {2}@{3}' -f $script:Tools.PnpmScript, ($baseArgs -join ' '), $t.name, $t.target) -ForegroundColor DarkGray
       Write-Host ''
     }
   }
@@ -586,12 +645,17 @@ $failed = @()
 if ($Batch) {
   Write-Info ("一次性安装 {0} 个: {1}" -f $specs.Count, ($specs -join ' '))
   $r = Invoke-PnpmStep -PnpmArgs ($baseArgs + $specs) -WorkDir $dir
-  $okAll = ($r.ExitCode -eq 0)
+  $softOnly = Test-OnlyIgnoredBuilds $r
+  $okAll = ($r.ExitCode -eq 0) -or $softOnly
+  $detail = if ($okAll) { '' } elseif ($softOnly) { '只有构建脚本被拦' } else { "整批失败 exit=$($r.ExitCode)" }
   foreach ($t in $chosen) {
-    $results += [pscustomobject]@{ name = $t.name; from = $t.current; to = $t.latest; ok = $okAll; seconds = $r.Seconds; detail = $(if ($okAll) { '' } else { "整批失败 exit=$($r.ExitCode)" }) }
+    $results += [pscustomobject]@{ name = $t.name; from = $(if ($t.installed) { $t.installed } else { $t.current }); to = $t.target; ok = $okAll; seconds = $r.Seconds; detail = $detail; downgrade = $t.isDowngrade }
     if (-not $okAll) { $failed += $t.name }
   }
-  if ($okAll) { Write-Ok ("整批完成（{0}s）" -f $r.Seconds) }
+  if ($okAll) {
+    Write-Ok ("整批完成（{0}s）" -f $r.Seconds)
+    if ($softOnly) { Write-IgnoredBuildsNote $r.Output }
+  }
   else {
     Write-Err ("整批失败（exit {0}, {1}s）" -f $r.ExitCode, $r.Seconds)
     ($r.Output.Trim() -split "`n" | Select-Object -Last 30) | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkRed; Write-LogLine "    $_" }
@@ -601,12 +665,15 @@ else {
   $i = 0
   foreach ($t in $chosen) {
     $i++
-    $spec = "$($t.name)@$($t.latest)"
-    Write-Host ("  [{0}/{1}] {2} ..." -f $i, $chosen.Count, $t.name) -ForegroundColor White
+    $spec = "$($t.name)@$($t.target)"
+    $fromVer = if ($t.installed) { $t.installed } else { $t.current }
+    Write-Host ("  [{0}/{1}] {2} ({3} -> {4}) ..." -f $i, $chosen.Count, $t.name, $fromVer, $t.target) -ForegroundColor White
     $r = Invoke-PnpmStep -PnpmArgs ($baseArgs + $spec) -WorkDir $dir
-    if ($r.ExitCode -eq 0) {
-      Write-Ok ("{0} {1} -> {2}  ({3}s)" -f $t.name, $t.current, $t.latest, $r.Seconds)
-      $results += [pscustomobject]@{ name = $t.name; from = $t.current; to = $t.latest; ok = $true; seconds = $r.Seconds; detail = '' }
+    $softOnly = Test-OnlyIgnoredBuilds $r
+    if ($r.ExitCode -eq 0 -or $softOnly) {
+      Write-Ok ("{0} {1} -> {2}  ({3}s)" -f $t.name, $fromVer, $t.target, $r.Seconds)
+      if ($softOnly) { Write-IgnoredBuildsNote $r.Output }
+      $results += [pscustomobject]@{ name = $t.name; from = $fromVer; to = $t.target; ok = $true; seconds = $r.Seconds; detail = $(if ($softOnly) { '构建脚本被拦' } else { '' }); downgrade = $t.isDowngrade }
     }
     else {
       Write-Err ("{0} 失败（exit {1}, {2}s）" -f $t.name, $r.ExitCode, $r.Seconds)
@@ -621,9 +688,11 @@ else {
         $hint = '该版本在 registry 上不存在，或需要 -Tag'
       } elseif ($r.Output -match 'ERR_PNPM_FETCH|ENOTFOUND|ETIMEDOUT|ECONNRESET|401|403') {
         $hint = '网络/凭据问题'
+      } elseif ($r.Output -match 'ERR_PNPM_INVALID_VERSION_UNION') {
+        $hint = 'pnpm-workspace.yaml 的 allowBuilds/minimumReleaseAgeExclude 里有不合法的 name@版本 写法'
       }
       if ($hint) { Write-Warn "  可能原因: $hint" }
-      $results += [pscustomobject]@{ name = $t.name; from = $t.current; to = $t.latest; ok = $false; seconds = $r.Seconds; detail = $(if ($hint) { $hint } else { "exit $($r.ExitCode)" }) }
+      $results += [pscustomobject]@{ name = $t.name; from = $fromVer; to = $t.target; ok = $false; seconds = $r.Seconds; detail = $(if ($hint) { $hint } else { "exit $($r.ExitCode)" }); downgrade = $t.isDowngrade }
       $failed += $t.name
     }
   }
@@ -633,7 +702,7 @@ else {
 Write-Head '校验'
 $after = (Read-ProfileDeps $dir).Deps
 foreach ($t in $chosen) {
-  $want = [string]$t.latest
+  $want = [string]$t.target
   $specNow = [string]$after[$t.name]
   $clean = $specNow -replace '^[\^~= ]+', ''
   $pkgJson = Join-Path $dir (Join-Path 'node_modules' (Join-Path $t.name 'package.json'))
@@ -664,14 +733,19 @@ if ($results.Count -gt 0) {
   $tbl = $results | Select-Object @{ n = '插件'; e = { $_.name } },
     @{ n = '原版本'; e = { $_.from } },
     @{ n = '目标'; e = { $_.to } },
+    @{ n = '类型'; e = { if ($_.downgrade) { '退回' } else { '升级' } } },
     @{ n = '结果'; e = { if ($_.ok) { '成功' } else { '失败' } } },
     @{ n = '耗时'; e = { "$($_.seconds)s" } },
     @{ n = '说明'; e = { $_.detail } }
   Write-Host ($tbl | Format-Table -AutoSize | Out-String -Width 200).TrimEnd()
 }
 Write-Host ''
+$downCount = @($results | Where-Object { $_.ok -and $_.downgrade }).Count
 if ($failed.Count -eq 0) {
-  Write-Host ("全部完成：{0} 个插件已更新。" -f $okCount) -ForegroundColor Green
+  if ($downCount -gt 0) {
+    Write-Host ("全部完成：{0} 个插件已处理，其中 {1} 个退回了兼容版本。" -f $okCount, $downCount) -ForegroundColor Green
+  }
+  else { Write-Host ("全部完成：{0} 个插件已更新。" -f $okCount) -ForegroundColor Green }
 } else {
   Write-Host ("部分失败：成功 {0} 个，失败 {1} 个 -> {2}" -f $okCount, $failed.Count, ($failed -join ', ')) -ForegroundColor Yellow
   if ($backup) {

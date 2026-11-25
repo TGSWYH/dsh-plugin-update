@@ -1,6 +1,11 @@
 // 查询 DSH profile 里第三方插件的最新版本（只读，不安装）。
 // 用法: node check-updates.mjs <profileDir> [--tag latest] [--dsh 0.2.2-rc.5]
-// 输出: 一行 JSON 数组，每项 { name, spec, kind, current, latest, hasUpdate, enginesDsh, compatible, deprecated, note }
+// 输出: 一行 JSON 数组，每项 {
+//   name, spec, kind, current, latest, hasUpdate, deprecated, note, unpackedSize,
+//   enginesDsh, enginesFrom, compatible,              // 最新版对 DSH 的要求
+//   installed, installedRange, installedRangeFrom, installedCompatible,  // 已装版本
+//   bestCompatible, bestCompatibleRange, bestCompatibleFrom,             // 当前 DSH 能用的最新版本
+//   target, targetNote }                              // 最终应安装的版本（null = 没有可装的）
 // 注意: 只把 JSON 写到 stdout，其它一律走 stderr。
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -130,10 +135,32 @@ async function getJson(url, accept) {
 
 const pkgUrl = (name) => `https://registry.npmjs.org/${name.replace('/', '%2f')}`;
 
+// DSH 插件的兼容范围有三个可能的落点，优先级从上到下：
+//   1. dsh.engines.dsh            —— @linxin666/dsh-web-all 这类用 dsh manifest 的
+//   2. engines.dsh                —— 最常见，纯 npm 式声明
+//   3. peerDependencies["@deepseek-ai/dsh"]
+// 只认第一个会漏掉 1 和 3，把「不兼容」误判成「无法校验」然后放行。
+const DSH_RANGE_FIELDS = [
+  ['dsh.engines.dsh', (m) => m.dsh && m.dsh.engines && m.dsh.engines.dsh],
+  ['engines.dsh', (m) => m.engines && m.engines.dsh],
+  ['peerDependencies', (m) => m.peerDependencies && m.peerDependencies['@deepseek-ai/dsh']],
+];
+
+function readDshRange(man) {
+  if (!man) return { range: null, from: null };
+  for (const [from, pick] of DSH_RANGE_FIELDS) {
+    let v;
+    try { v = pick(man); } catch { v = null; }
+    if (v && String(v).trim()) return { range: String(v).trim(), from };
+  }
+  return { range: null, from: null };
+}
+
 async function inspect(name, spec) {
   const row = {
     name, spec, kind: 'npm', current: spec, latest: null, hasUpdate: false,
-    enginesDsh: null, compatible: null, deprecated: null, note: null, unpackedSize: null,
+    enginesDsh: null, enginesFrom: null, compatible: null, deprecated: null, note: null, unpackedSize: null,
+    installed: null, installedCompatible: null,
   };
   if (NON_NPM.test(spec)) {
     row.kind = 'git';
@@ -167,8 +194,10 @@ async function inspect(name, spec) {
   row.hasUpdate = true;
   try {
     const man = await getJson(`${pkgUrl(name)}/${latest}`);
-    if (man.engines && man.engines.dsh) {
-      row.enginesDsh = String(man.engines.dsh);
+    const got = readDshRange(man);
+    if (got.range) {
+      row.enginesDsh = got.range;
+      row.enginesFrom = got.from;
       if (opt.dsh) row.compatible = satisfies(opt.dsh, row.enginesDsh);
     }
     if (man.deprecated) row.deprecated = String(man.deprecated);
@@ -179,6 +208,51 @@ async function inspect(name, spec) {
   return row;
 }
 
+// 已装版本是否和当前 DSH 兼容（不联网，直接读 node_modules 里的 package.json）
+function inspectInstalled(name) {
+  const p = join(profileDir, 'node_modules', ...name.split('/'), 'package.json');
+  let man;
+  try { man = JSON.parse(readFileSync(p, 'utf8')); } catch { return { installed: null, range: null, from: null, compatible: null }; }
+  const got = readDshRange(man);
+  return {
+    installed: man.version || null,
+    range: got.range,
+    from: got.from,
+    compatible: got.range && opt.dsh ? satisfies(opt.dsh, got.range) : null,
+  };
+}
+
+// 在某个包的全部版本里找「最新的、且与当前 DSH 兼容的」版本。
+// 只有在最新版不兼容、或已装版本不兼容时才调用（要拉完整 packument，比 abbreviated 大）。
+const bestCache = new Map();
+async function bestCompatible(name) {
+  if (bestCache.has(name)) return bestCache.get(name);
+  let result = { version: null, range: null, from: null, note: null };
+  try {
+    const doc = await getJson(pkgUrl(name)); // 完整 packument，才带 dsh 字段
+    const vers = Object.keys(doc.versions || {}).filter((v) => parseSemver(v));
+    vers.sort((a, b) => cmpSemver(parseSemver(b), parseSemver(a))); // 从新到旧
+    for (const v of vers) {
+      const got = readDshRange(doc.versions[v]);
+      // 没有兼容声明的版本视为不限制，但只在没有任何带声明的版本可用时才接受
+      if (got.range && satisfies(opt.dsh, got.range) === true) {
+        result = { version: v, range: got.range, from: got.from, note: null };
+        break;
+      }
+    }
+    if (!result.version) {
+      for (const v of vers) {
+        if (!readDshRange(doc.versions[v]).range) { result = { version: v, range: null, from: null, note: '没有兼容声明' }; break; }
+      }
+    }
+    if (!result.version) result.note = '所有版本都要求更高的 DSH';
+  } catch (e) {
+    result.note = `查询失败: ${e && e.message ? e.message : e}`;
+  }
+  bestCache.set(name, result);
+  return result;
+}
+
 /* 分批跑，避免一次打 20 个连接 */
 const names = Object.keys(deps).sort();
 const rows = [];
@@ -186,6 +260,60 @@ const CHUNK = 5;
 for (let i = 0; i < names.length; i += CHUNK) {
   const part = await Promise.all(names.slice(i, i + CHUNK).map((n) => inspect(n, String(deps[n] ?? ''))));
   rows.push(...part);
+}
+
+// 补上「当前已装版本」的兼容性，让调用方能看到已经躺在 node_modules 里的不兼容插件；
+// 如果最新版（或已装版）与当前 DSH 不兼容，再往前找一个最新的兼容版本当目标。
+for (const row of rows) {
+  const inst = inspectInstalled(row.name);
+  row.installed = inst.installed;
+  row.installedRange = inst.range;
+  row.installedRangeFrom = inst.from;
+  row.installedCompatible = inst.compatible;
+
+  row.bestCompatible = null;
+  row.bestCompatibleRange = null;
+  row.bestCompatibleFrom = null;
+  row.target = row.hasUpdate ? row.latest : null; // 最终要装的版本
+  row.targetNote = null;
+
+  const latestBlocked = row.hasUpdate && row.compatible === false;
+  const installedBlocked = row.installedCompatible === false;
+  if (row.kind !== 'npm' || (!latestBlocked && !installedBlocked)) continue;
+
+  const best = await bestCompatible(row.name);
+  row.bestCompatible = best.version;
+  row.bestCompatibleRange = best.range;
+  row.bestCompatibleFrom = best.from;
+
+  if (latestBlocked) {
+    if (!best.version) {
+      row.target = null;
+      row.targetNote = `最新版要求 DSH ${row.enginesDsh}；${best.note || '找不到更旧的兼容版本'}`;
+    } else if (cmpSemver(parseSemver(best.version), parseSemver(row.current)) > 0) {
+      row.target = best.version;
+      row.targetNote = `最新版 ${row.latest} 要求 DSH ${row.enginesDsh}，改投最新兼容版 ${best.version}`;
+    } else {
+      row.target = null;
+      row.targetNote = `已是最新的兼容版本 ${row.current}（${row.latest} 要求 DSH ${row.enginesDsh}）`;
+    }
+  } else if (installedBlocked) {
+    // 已装版本不兼容：即使没有更新，也值得退到兼容版本（-Repair 时执行）
+    row.target = best.version || null;
+    row.targetNote = best.version
+      ? `已装的 ${row.installed} 要求 ${row.installedRange}，退回兼容版 ${best.version}`
+      : (best.note || '找不到兼容版本');
+  }
+  // 目标比已装的低 = 退回（调用方据此在计划里标「退回」而不是「升级」）
+}
+
+// 统一算 isDowngrade（对所有行，不只是在上面走过兼容性分支的）
+for (const row of rows) {
+  row.isDowngrade = false;
+  if (!row.target) continue;
+  const a = parseSemver(row.target);
+  const b = parseSemver(String(row.installed || row.current || '').replace(/^[\^~= ]+/, ''));
+  if (a && b && cmpSemver(a, b) < 0) row.isDowngrade = true;
 }
 
 process.stdout.write(JSON.stringify(rows));
